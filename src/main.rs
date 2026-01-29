@@ -5,7 +5,7 @@ use std::mem::MaybeUninit;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::{Duration, Instant};
 
-const MULTICAST_ADDR: &str = "ff12:c909:3199:e8ba:6f6f:7d23:e6ae:d85d";
+const MULTICAST_ADDR: &str = "ff18:c909:3199:e8ba:6f6f:7d23:e6ae:d85d";
 const PORT: u16 = 9999;
 const BUFFER_SIZE: usize = 1024;
 
