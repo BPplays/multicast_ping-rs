@@ -1,16 +1,18 @@
 // multicast_ping.rs
 // A small async Rust program that can run in client or server mode.
-// - Server mode (-s) binds to the given port, joins the IPv6 multicast group and replies (unicast) to any packet it receives.
-// - Client mode (default) periodically sends multicast "PING <seq>" packets every -n milliseconds and counts replies to report success %.
+// - Server mode (-s) binds to the given port, joins the specified IPv6 multicast group, and replies (unicast) to any incoming packet with an `ACK:` echo.
+// - Client mode (default) periodically sends multicast "PING <seq>" packets every -n milliseconds and counts replies; prints running stats and a final summary on Ctrl+C.
 //
 // Usage examples:
-//  Server: cargo run --release -- -s -a ff12c909:3199:e8ba:6f6f:7d23:e6ae:d85d -p 3000 -i 2
+//  Server: cargo run --release -- -s -a ff12c909:3199:e8ba:6f6f:7d23:e6ae:d85d -p 3000 -I eth0
 //  Client: cargo run --release -- -a ff12c909:3199:e8ba:6f6f:7d23:e6ae:d85d -p 3000 -n 500 -t 800
-// Note: some systems require an explicit interface index when joining IPv6 multicast. Use -i to pass the interface index (0 = default / all on some systems).
+// Note: some systems require an explicit interface when joining IPv6 multicast. Use -I/--ifname to pass the interface name (e.g. eth0). The program converts the name to an index using libc::if_nametoindex.
+// Add `libc = "0.2"` to your Cargo.toml dependencies if not already present.
 
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
+use std::ffi::CString;
 
 use clap::Parser;
 use tokio::sync::atomic::{AtomicUsize, Ordering};
@@ -38,9 +40,9 @@ struct Args {
 	#[arg(short = 't', long, default_value_t = 500)]
 	timeout_ms: u64,
 
-	/// Optional interface index for joining multicast (use 0 for default)
-	#[arg(short = 'i', long, default_value_t = 0)]
-	if_index: u32,
+	/// Optional interface name for joining multicast (server; e.g. eth0). If omitted uses index 0 (system default).
+	#[arg(short = 'I', long = "ifname")]
+	if_name: Option<String>,
 }
 
 fn try_fix_ipv6_str(s: &str) -> String {
@@ -79,7 +81,7 @@ fn parse_ipv6_addr(s: &str) -> anyhow::Result<Ipv6Addr> {
 		println!("Note: fixed multicast address from '{}' -> '{}'", s, fixed);
 		return Ok(v);
 	}
-	anyhow::bail!("failed to parse IPv6 address '{}', tried '{}', and '{}'", s, s, fixed)
+	anyhow::bail!("failed to parse IPv6 address '{}', tried '{}'", s, fixed)
 }
 
 #[tokio::main]
@@ -91,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
 	let multicast_sock = SocketAddr::V6(SocketAddrV6::new(multicast, args.port, 0, 0));
 
 	if args.server {
-		run_server(multicast, args.port, args.if_index).await?;
+		run_server(multicast, args.port, args.if_name.clone()).await?;
 	} else {
 		run_client(multicast_sock, args.interval_ms, args.timeout_ms).await?;
 	}
@@ -99,7 +101,20 @@ async fn main() -> anyhow::Result<()> {
 	Ok(())
 }
 
-async fn run_server(multicast: Ipv6Addr, port: u16, if_index: u32) -> anyhow::Result<()> {
+async fn run_server(multicast: Ipv6Addr, port: u16, if_name: Option<String>) -> anyhow::Result<()> {
+	// Convert optional interface name to index using libc::if_nametoindex
+	let if_index: u32 = if let Some(name) = if_name {
+		let c = CString::new(name.clone()).map_err(|e| anyhow::anyhow!("invalid interface name: {}", e))?;
+		// SAFETY: if_nametoindex is a C function; it returns 0 on failure
+		let idx = unsafe { libc::if_nametoindex(c.as_ptr()) } as u32;
+		if idx == 0 {
+			anyhow::bail!("interface name '{}' not found or cannot be converted to index", name);
+		}
+		idx
+	} else {
+		0u32
+	};
+
 	println!("Starting server: joining multicast {} on port {} (if_index={})", multicast, port, if_index);
 
 	// Bind to wildcard IPv6 on the port
@@ -216,7 +231,7 @@ async fn run_client(multicast_sock: SocketAddr, interval_ms: u64, timeout_ms: u6
 	let pct = if s == 0 { 0.0 } else { (r as f64) * 100.0 / (s as f64) };
 	println!("FINAL: sent={} recv={} success={:.2}%", s, r, pct);
 
-	// ensure stats_printer finishes (it won\'t by itself) — just abort
+	// ensure stats_printer finishes (it won't by itself) — just abort
 	stats_printer.abort();
 
 	Ok(())
