@@ -1,311 +1,241 @@
-use anyhow::{bail, Context, Result};
 use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::io::{self, ErrorKind};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+const MULTICAST_ADDR: Ipv6Addr = Ipv6Addr::new(0xff12, 0xc09, 0x3199, 0xe8ba, 0x6f6f, 0x7d23, 0xe6ae, 0xd85d);
+const PORT: u16 = 9999;
+const BUFFER_SIZE: usize = 1024;
+
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Simple IPv6 multicast client/server that pings multicast and reports reply %")]
+#[command(author, version, about = "IPv6 Multicast Client/Server Monitor", long_about = None)]
 struct Args {
-	/// server mode (listen for multicast and reply unicast)
-	#[arg(short = 's', long = "server")]
+	/// Run in server mode (listen for multicast and respond with unicast)
+	#[arg(short, long)]
 	server: bool,
 
-	/// multicast IPv6 address to use (required)
-	#[arg(short = 'g', long = "group", default_value = "ff12:c:909:3199:e8ba:6f6f:7d23:e6ae:d85d")]
-	group: String,
+	/// Interval in milliseconds between multicast requests (client mode)
+	#[arg(short = 'n', long, default_value = "1000")]
+	interval: u64,
 
-	/// UDP port to use
-	#[arg(short = 'p', long = "port", default_value_t = 12345)]
-	port: u16,
-
-	/// interval in milliseconds between client multicast requests (client mode)
-	#[arg(short = 'n', long = "interval", default_value_t = 1000)]
-	interval_ms: u64,
-
-	/// interface to use (name like "eth0" or numeric index). optional.
-	#[arg(short = 'I', long = "iface")]
-	iface: Option<String>,
-
-	/// message to send (client mode) or reply with (server mode)
-	#[arg(short = 'm', long = "message", default_value = "ping")]
-	message: String,
+	/// Network interface name (e.g., eth0, wlan0, Ethernet)
+	#[arg(short = 'i', long)]
+	interface: Option<String>,
 }
 
-fn if_name_to_index(name: &str) -> Option<u32> {
-	// Try Unix libc if available
-	#[cfg(unix)]
-	{
-		use std::ffi::CString;
-		let c = CString::new(name).ok()?;
-		let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
-		if idx == 0 {
-			return None;
-		} else {
-			return Some(idx);
-		}
-	}
-
-	// Try Windows API If_nametoindex via windows-sys if available
-	#[cfg(windows)]
-	{
-		use std::ffi::CString;
-		use windows_sys::Win32::NetworkManagement::IpHelper::If_nametoindex;
-		let c = CString::new(name).ok()?;
-		let idx = unsafe { If_nametoindex(c.as_ptr()) };
-		if idx == 0 {
-			return None;
-		} else {
-			return Some(idx);
-		}
-	}
-
-	#[cfg(not(any(unix, windows)))]
-	{
-		None
-	}
-}
-
-fn parse_iface(iface: &Option<String>) -> Result<u32> {
-	if let Some(s) = iface {
-		// try parse numeric first
-		if let Ok(i) = s.parse::<u32>() {
-			return Ok(i);
-		}
-		// try name -> index
-		if let Some(idx) = if_name_to_index(s) {
-			return Ok(idx);
-		} else {
-			bail!("could not resolve interface name '{}' to index; try passing numeric index instead", s);
-		}
-	}
-	Ok(0) // 0 means "default" interface for many socket operations
-}
-
-fn make_recv_socket(port: u16, mcast: Ipv6Addr, iface_index: u32) -> Result<UdpSocket> {
-	// Create IPv6 UDP socket using socket2 to set options then convert to std::net::UdpSocket
-	let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-	// allow multiple listeners on same port/address on unix (SO_REUSEADDR). On windows this acts differently.
-	sock.set_reuse_address(true)?;
-	#[cfg(unix)]
-	{
-		// On unix it's usually useful to set reuse_port as well so multiple programs can bind same multicast port
-		sock.set_reuse_port(true).ok();
-	}
-	// Bind to [::]:port (listen on all addresses)
-	let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0);
-	sock.bind(&addr.into())?;
-
-	// join multicast group
-	sock.join_multicast_v6(&mcast, iface_index)?;
-
-	// Convert to std UdpSocket
-	let std_sock: UdpSocket = sock.into();
-	std_sock.set_nonblocking(false)?;
-	Ok(std_sock)
-}
-
-fn make_send_socket(iface_index: u32) -> Result<UdpSocket> {
-	let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-	// allow reuse
-	sock.set_reuse_address(true)?;
-	#[cfg(unix)]
-	{
-		sock.set_reuse_port(true).ok();
-	}
-	// bind to ephemeral port on unspecified address (so recv_from works)
-	let bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-	sock.bind(&bind_addr.into())?;
-
-	// set outgoing interface for multicast (0 means default)
-	if iface_index != 0 {
-		sock.set_multicast_if_v6(iface_index)?;
-	}
-
-	// optional: set hop limit for multicast so it can traverse multiple routers if desired
-	// sock.set_multicast_hops_v6(10)?; // uncomment/change as needed
-
-	let udp: UdpSocket = sock.into();
-	Ok(udp)
-}
-
-fn run_server(args: &Args, iface_index: u32, mcast_addr: Ipv6Addr) -> Result<()> {
-	println!("Starting server: join group {} port {} (iface_index={})", mcast_addr, args.port, iface_index);
-	let sock = make_recv_socket(args.port, mcast_addr, iface_index)?;
-	let message_reply = args.message.clone();
-
-	// dead-simple loop: receive and reply to sender with unicast
-	let mut buf = [0u8; 1500];
-	loop {
-		let (n, src) = match sock.recv_from(&mut buf) {
-			Ok(s) => s,
-			Err(e) => {
-				eprintln!("recv error: {e}");
-				continue;
-			}
-		};
-		let data = &buf[..n];
-		println!("received {} bytes from {}", n, src);
-		// reply as unicast to src
-		let reply_bytes = message_reply.as_bytes();
-		match sock.send_to(reply_bytes, &src) {
-			Ok(sent) => {
-				println!("sent {} bytes reply to {}", sent, src);
-			}
-			Err(e) => {
-				eprintln!("failed to send reply to {}: {}", src, e);
-			}
-		}
-	}
-}
-
-fn run_client(args: &Args, iface_index: u32, mcast_addr: Ipv6Addr) -> Result<()> {
-	println!(
-		"Starting client: send multicast to {}:{} every {}ms (iface_index={})",
-		mcast_addr, args.port, args.interval_ms, iface_index
-	);
-
-	let send_sock = make_send_socket(iface_index)?;
-	let recv_sock = {
-		// We'll bind a socket to the same ephemeral port to listen for replies.
-		// This socket is separate and bound to ::, ephemeral port so remote servers can reply.
-		let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-		s.set_reuse_address(true)?;
-		#[cfg(unix)]
-		{ s.set_reuse_port(true).ok(); }
-		// bind to ephemeral port (0)
-		s.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into())?;
-		let u: UdpSocket = s.into();
-		u
-	};
-
-	// We want to know what local port we send from so replies come back correctly.
-	// If the send socket was bound to ephemeral, get its local addr.
-	let local_addr = send_sock.local_addr().context("failed to get local addr")?;
-	println!("local addr used for sending: {}", local_addr);
-
-	// We'll use the same socket to send; make sure we set a read timeout on recv socket
-	recv_sock
-		.set_read_timeout(Some(Duration::from_millis(500)))
-		.ok();
-
-	// data structures for stats
-	let stats = Arc::new(Mutex::new(ClientStats {
-		total_sent: 0,
-		total_replies: 0,
-		per_server: HashMap::new(),
-	}));
-
-	// spawn receiver thread
-	{
-		let recv = recv_sock.try_clone().context("clone recv socket")?;
-		let stats_rx = Arc::clone(&stats);
-		thread::spawn(move || {
-			let mut buf = [0u8; 1500];
-			loop {
-				match recv.recv_from(&mut buf) {
-					Ok((n, src)) => {
-						let data = &buf[..n];
-						let key = src.ip();
-						let mut st = stats_rx.lock().unwrap();
-						st.total_replies += 1;
-						let entry = st.per_server.entry(key).or_insert_with(|| ServerStat { replies: 0 });
-						entry.replies += 1;
-						println!("reply {} bytes from {}: {}", n, src, String::from_utf8_lossy(data));
-					}
-					Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-						// no data, continue
-						thread::sleep(Duration::from_millis(10));
-						continue;
-					}
-					Err(e) => {
-						eprintln!("recv err: {}", e);
-						thread::sleep(Duration::from_millis(100));
-					}
-				}
-			}
-		});
-	}
-
-	// send loop
-	let target = SocketAddr::V6(SocketAddrV6::new(mcast_addr, args.port, 0, 0));
-	let interval = Duration::from_millis(args.interval_ms.max(1));
-	let stats_main = Arc::clone(&stats);
-	let msg_bytes = args.message.clone().into_bytes();
-	let mut next_print = Instant::now() + Duration::from_secs(5);
-
-	loop {
-		// send multicast packet
-		match send_sock.send_to(&msg_bytes, &target) {
-			Ok(sent) => {
-				let mut st = stats_main.lock().unwrap();
-				st.total_sent += 1;
-				drop(st);
-				// println!("sent {} bytes to {}", sent, target);
-			}
-			Err(e) => {
-				eprintln!("send error: {}", e);
-			}
-		}
-
-		// periodically print stats
-		if Instant::now() >= next_print {
-			let st = stats_main.lock().unwrap();
-			let total_sent = st.total_sent.max(1); // avoid div by zero
-			let total_replies = st.total_replies;
-			let pct = (total_replies as f64) * 100.0 / (total_sent as f64);
-			println!(
-				"Total sent: {}  Total replies: {}  Reply %: {:.2}%",
-				total_sent, total_replies, pct
-			);
-			if !st.per_server.is_empty() {
-				println!("Per-server replies:");
-				for (ip, s) in st.per_server.iter() {
-					// estimate per-server reply % = replies / total_sent
-					let p = (s.replies as f64) * 100.0 / (total_sent as f64);
-					println!("  {} -> {} replies ({:.2}% of total requests)", ip, s.replies, p);
-				}
-			}
-			next_print = Instant::now() + Duration::from_secs(5);
-		}
-
-		thread::sleep(interval);
-	}
-}
-
-struct ServerStat {
-	replies: u64,
-}
-
-struct ClientStats {
-	total_sent: u64,
-	total_replies: u64,
-	per_server: HashMap<IpAddr, ServerStat>,
-}
-
-fn main() -> Result<()> {
+fn main() -> io::Result<()> {
 	let args = Args::parse();
 
-	// parse multicast IPv6 address
-	let mcast_addr = Ipv6Addr::from_str(&args.group)
-		.with_context(|| format!("invalid IPv6 address '{}'", args.group))?;
-
-	// basic check it's a multicast address
-	if !mcast_addr.is_multicast() {
-		eprintln!("Warning: {} is not an IPv6 multicast address (continuing anyway)", mcast_addr);
-	}
-
-	let iface_index = parse_iface(&args.iface)?;
-
 	if args.server {
-		run_server(&args, iface_index, mcast_addr)?;
+		println!("Starting server mode...");
+		println!("Listening on multicast address: [{}]:{}", MULTICAST_ADDR, PORT);
+		run_server(args.interface)?;
 	} else {
-		run_client(&args, iface_index, mcast_addr)?;
+		println!("Starting client mode...");
+		println!("Sending multicast requests every {} ms", args.interval);
+		println!("Target: [{}]:{}", MULTICAST_ADDR, PORT);
+		run_client(args.interval, args.interface)?;
 	}
 
 	Ok(())
+}
+
+fn run_server(interface: Option<String>) -> io::Result<()> {
+	// Create UDP socket
+	let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+
+	// Allow address reuse
+	socket.set_reuse_address(true)?;
+	#[cfg(unix)]
+	socket.set_reuse_port(true)?;
+
+	// Bind to the multicast port
+	let bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, PORT, 0, 0);
+	socket.bind(&bind_addr.into())?;
+
+	// Join the multicast group
+	let interface_index = if let Some(ref if_name) = interface {
+		get_interface_index(if_name)?
+	} else {
+		0 // Default interface
+	};
+
+	socket.join_multicast_v6(&MULTICAST_ADDR, interface_index)?;
+	println!("Joined multicast group on interface index {}", interface_index);
+
+	let mut buf = [0u8; BUFFER_SIZE];
+	let mut packet_count = 0u64;
+
+	loop {
+		match socket.recv_from(&mut buf) {
+			Ok((len, addr)) => {
+				packet_count += 1;
+				let client_addr = match addr.as_socket() {
+					Some(socket_addr) => socket_addr,
+					None => {
+						eprintln!("Invalid address format");
+						continue;
+					}
+				};
+
+				println!("[{}] Received {} bytes from {}", packet_count, len, client_addr);
+
+				// Send unicast response back to the client
+				let response = format!("RESPONSE:{}", packet_count);
+				match socket.send_to(response.as_bytes(), &addr) {
+					Ok(_) => println!("[{}] Sent response to {}", packet_count, client_addr),
+					Err(e) => eprintln!("[{}] Failed to send response: {}", packet_count, e),
+				}
+			}
+			Err(e) => {
+				eprintln!("Error receiving: {}", e);
+			}
+		}
+	}
+}
+
+fn run_client(interval_ms: u64, interface: Option<String>) -> io::Result<()> {
+	// Create UDP socket for sending
+	let send_socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+
+	// Bind to any available port for sending
+	let bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+	send_socket.bind(&bind_addr.into())?;
+
+	// Set multicast interface if specified
+	let interface_index = if let Some(ref if_name) = interface {
+		let idx = get_interface_index(if_name)?;
+		send_socket.set_multicast_if_v6(idx)?;
+		println!("Using interface index {} for multicast", idx);
+		idx
+	} else {
+		0
+	};
+
+	// Create socket for receiving responses
+	let recv_socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+	recv_socket.set_reuse_address(true)?;
+
+	// Get the local port we're bound to
+	let local_addr = send_socket.local_addr()?;
+	let local_port = match local_addr.as_socket() {
+		Some(SocketAddr::V6(addr)) => addr.port(),
+		Some(SocketAddr::V4(_)) => {
+			return Err(io::Error::new(ErrorKind::Other, "Expected IPv6 address"));
+		}
+		None => {
+			return Err(io::Error::new(ErrorKind::Other, "Invalid local address"));
+		}
+	};
+
+	// Bind receive socket to the same port
+	let recv_bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, local_port, 0, 0);
+	recv_socket.bind(&recv_bind_addr.into())?;
+
+	// Set receive timeout
+	recv_socket.set_read_timeout(Some(Duration::from_millis(interval_ms / 2)))?;
+
+	println!("Bound to local port: {}", local_port);
+
+	let sent_count = Arc::new(AtomicU64::new(0));
+	let recv_count = Arc::new(AtomicU64::new(0));
+
+	let recv_count_clone = Arc::clone(&recv_count);
+	let sent_count_clone = Arc::clone(&sent_count);
+
+	// Spawn receiver thread
+	let recv_handle = std::thread::spawn(move || {
+		let mut buf = [0u8; BUFFER_SIZE];
+		loop {
+			match recv_socket.recv_from(&mut buf) {
+				Ok((len, addr)) => {
+					let count = recv_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
+					let msg = String::from_utf8_lossy(&buf[..len]);
+					if let Some(socket_addr) = addr.as_socket() {
+						println!("← Received response #{} from {}: {}", count, socket_addr, msg);
+					}
+				}
+				Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+					// Timeout is expected, continue
+				}
+				Err(e) => {
+					eprintln!("Receive error: {}", e);
+				}
+			}
+		}
+	});
+
+	// Main sending loop
+	let multicast_target = SocketAddrV6::new(MULTICAST_ADDR, PORT, 0, 0);
+	let interval = Duration::from_millis(interval_ms);
+	let start_time = Instant::now();
+
+	loop {
+		let count = sent_count.fetch_add(1, Ordering::SeqCst) + 1;
+		let message = format!("PING:{}", count);
+
+		match send_socket.send_to(message.as_bytes(), &multicast_target.into()) {
+			Ok(_) => {
+				let received = recv_count.load(Ordering::SeqCst);
+				let percent = if count > 0 {
+					(received as f64 / count as f64) * 100.0
+				} else {
+					0.0
+				};
+
+				let elapsed = start_time.elapsed().as_secs();
+				println!("→ Sent multicast #{} | Responses: {}/{} ({:.1}%) | Runtime: {}s",
+						 count, received, count, percent, elapsed);
+			}
+			Err(e) => {
+				eprintln!("Send error: {}", e);
+			}
+		}
+
+		std::thread::sleep(interval);
+	}
+}
+
+fn get_interface_index(if_name: &str) -> io::Result<u32> {
+	#[cfg(unix)]
+	{
+		use std::ffi::CString;
+		let c_name = CString::new(if_name)
+			.map_err(|_| io::Error::new(ErrorKind::InvalidInput, "Invalid interface name"))?;
+
+		let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+		if index == 0 {
+			return Err(io::Error::new(
+				ErrorKind::NotFound,
+				format!("Interface '{}' not found", if_name),
+			));
+		}
+		Ok(index)
+	}
+
+	#[cfg(windows)]
+	{
+		use std::net::UdpSocket;
+		// On Windows, try to get the interface index
+		// This is a simplified approach - on Windows you may need to use
+		// the Windows API (GetAdaptersAddresses) for better interface lookup
+
+		// Try to parse as a number first (Windows sometimes uses indices directly)
+		if let Ok(index) = if_name.parse::<u32>() {
+			return Ok(index);
+		}
+
+		// Otherwise, return error with helpful message
+		Err(io::Error::new(
+			ErrorKind::NotFound,
+			format!(
+				"Interface '{}' lookup not fully supported on Windows. \
+				Try using the interface index number instead (find with 'netsh interface ipv6 show interface')",
+				if_name
+			),
+		))
+	}
 }
