@@ -1,6 +1,7 @@
 use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{self, ErrorKind};
+use std::mem::MaybeUninit;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::{Duration, Instant};
 
@@ -39,8 +40,6 @@ fn run_server() -> io::Result<()> {
     // Create UDP socket
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
 
     // Bind to the port on all interfaces
     let bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, PORT, 0, 0);
@@ -52,13 +51,18 @@ fn run_server() -> io::Result<()> {
 
     println!("Server ready and listening...\n");
 
-    let mut buffer = [0u8; BUFFER_SIZE];
+    let mut buffer = [MaybeUninit::<u8>::uninit(); BUFFER_SIZE];
 
     loop {
         // Receive multicast message
         match socket.recv_from(&mut buffer) {
             Ok((len, sender_addr)) => {
-                let received = String::from_utf8_lossy(&buffer[..len]);
+                // Safe to assume_init because recv_from initialized these bytes
+                let received_data: Vec<u8> = buffer[..len]
+                    .iter()
+                    .map(|b| unsafe { b.assume_init() })
+                    .collect();
+                let received = String::from_utf8_lossy(&received_data);
                 println!("Received {} bytes from {}: {}", len, sender_addr.as_socket().unwrap(), received);
 
                 // Send unicast response back to the sender
@@ -124,13 +128,18 @@ fn run_client(interval_ms: u64) -> io::Result<()> {
         }
 
         // Wait for response with timeout
-        let mut buffer = [0u8; BUFFER_SIZE];
+        let mut buffer = [MaybeUninit::<u8>::uninit(); BUFFER_SIZE];
         let mut received_response = false;
 
         while send_time.elapsed() < response_timeout {
             match send_socket.recv_from(&mut buffer) {
                 Ok((len, _sender)) => {
-                    let response = String::from_utf8_lossy(&buffer[..len]);
+                    // Safe to assume_init because recv_from initialized these bytes
+                    let received_data: Vec<u8> = buffer[..len]
+                        .iter()
+                        .map(|b| unsafe { b.assume_init() })
+                        .collect();
+                    let response = String::from_utf8_lossy(&received_data);
                     if response.starts_with("ACK") {
                         received_count += 1;
                         received_response = true;
