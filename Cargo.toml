@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+clap = "4.5.56"
+tokio = "1.49.0"
